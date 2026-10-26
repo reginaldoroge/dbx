@@ -903,7 +903,7 @@ jobs:
           )
 
       - name: Attest native release archives
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: release-assets/*
 
@@ -1000,7 +1000,7 @@ jobs:
           )
 
       - name: Attest native CLI release archives
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: release-assets/*
 
