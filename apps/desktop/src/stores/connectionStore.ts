@@ -715,7 +715,6 @@ export const useConnectionStore = defineStore("connection", () => {
     return connectionGroupIdForSelection(sidebarLayout.value, selectedNodeId, selectedNode?.connectionId);
   });
   let layoutPersistTimer: ReturnType<typeof setTimeout> | null = null;
-  let sidebarLayoutRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let sidebarLayoutSyncTimer: ReturnType<typeof setInterval> | null = null;
   let sidebarLayoutSyncInFlight = false;
   let sidebarLayoutPersistInFlight: Promise<void> | null = null;
@@ -4438,6 +4437,9 @@ export const useConnectionStore = defineStore("connection", () => {
     } else {
       nextConnections.push(normalized);
       const groupId = targetGroupId !== undefined ? targetGroupId : newConnectionGroupId.value;
+      // Bump before the assignment: the persist below awaits, and a poll that read
+      // the pre-add connection list must not reconcile the new entry away.
+      sidebarLayoutRevision += 1;
       sidebarLayout.value = appendConnectionToLayout(sidebarLayout.value, normalized.id, groupId);
     }
     await persistConnections(nextConnections);
@@ -10502,7 +10504,21 @@ export const useConnectionStore = defineStore("connection", () => {
     let layoutSaveStarted = false;
     let layoutSaveVersion = 0;
 
+    let revisionAfterOwnSave = sidebarLayoutRevision;
     try {
+      // Drop the members from the live layout first: a debounced snapshot taken
+      // while the connection writes below are in flight would otherwise still
+      // contain them and put the deleted rows back on disk.
+      const targetLayout = applyLayout(sidebarLayout.value);
+      if (targetLayout !== sidebarLayout.value) {
+        sidebarLayout.value = targetLayout;
+        sidebarLayoutRevision += 1;
+        rebuildTreeNodes();
+        layoutSaveStarted = true;
+        const queued = queueSidebarLayoutSave(targetLayout);
+        layoutSaveVersion = queued.version;
+        revisionAfterOwnSave = sidebarLayoutRevision;
+      }
       if (connectionsChanged) {
         await persistConnections(nextConnections, removedConnectionIds);
         connectionsPersisted = true;
@@ -10511,19 +10527,15 @@ export const useConnectionStore = defineStore("connection", () => {
         await persistTimeoutInheritanceIds(nextConnectTimeoutIds, nextQueryTimeoutIds);
         timeoutSettingsPersisted = true;
       }
-      const targetLayout = applyLayout(sidebarLayout.value);
-      if (targetLayout !== sidebarLayout.value) {
-        layoutSaveStarted = true;
-        const queued = queueSidebarLayoutSave(targetLayout);
-        layoutSaveVersion = queued.version;
-        await queued.promise;
+      if (layoutSaveStarted) {
+        await sidebarLayoutSaveChain;
         appliedLayout = targetLayout;
       }
     } catch (error) {
       const rollbackErrors: unknown[] = [];
       // A newer write already reflects a newer decision; restoring the layout we
       // tried to delete would land after it and undo the user's latest edit.
-      if (layoutSaveStarted && layoutSaveVersion === sidebarLayoutSaveVersion) {
+      if (layoutSaveStarted && layoutSaveVersion === sidebarLayoutSaveVersion && revisionAfterOwnSave === sidebarLayoutRevision) {
         try {
           await queueSidebarLayoutSave(previousLayout).promise;
         } catch (rollbackError) {
@@ -10634,11 +10646,9 @@ export const useConnectionStore = defineStore("connection", () => {
       return save.catch((error: unknown) => {
         if (retriesLeft === 0 || version !== sidebarLayoutSaveVersion) throw error;
         return new Promise<void>((resolve, reject) => {
-          // The retry must not share the debounce timer: a new edit would clear it,
-          // leaving this promise pending and an awaiting deletion hung.
-          if (sidebarLayoutRetryTimer) clearTimeout(sidebarLayoutRetryTimer);
-          sidebarLayoutRetryTimer = setTimeout(() => {
-            sidebarLayoutRetryTimer = null;
+          // Each attempt owns its timer: cancelling another save's timer would leave
+          // that save's promise pending forever (an awaiting deletion would hang).
+          setTimeout(() => {
             if (version !== sidebarLayoutSaveVersion) {
               reject(error);
               return;
@@ -11470,22 +11480,31 @@ export const useConnectionStore = defineStore("connection", () => {
         syncTimeoutInheritanceBackup();
         // 旧版本写下的行可能缺字段（如 version），一律归一化后再进内存，避免脏数据被原样写回。
         tableVGroupLayouts.value = Object.fromEntries(Object.entries(loadedTableVGroups ?? {}).map(([scopeKey, layout]) => [scopeKey, normalizeTableVGroupLayoutOp(layout)]));
+        // The read below can span an edit and its save; capture the revision so a
+        // snapshot that predates either is not adopted as the truth on disk.
+        const layoutRevisionBeforeRead = sidebarLayoutRevision;
         const savedLayout = await api.loadSidebarLayout();
         const currentLayout = sidebarLayout.value.groups.length || sidebarLayout.value.order.length ? sidebarLayout.value : null;
-        // A reload must not swallow an edit that is still sitting in the debounce or
-        // in an in-flight write: the disk snapshot predates it, so keep the live
-        // layout and let the pending save (or the poll) settle the row.
         const hasPendingLayoutWrite = layoutPersistTimer !== null || sidebarLayoutPersistInFlight !== null;
-        sidebarLayout.value = hasPendingLayoutWrite
-          ? reconcileLayout(
-              connections.value.map((c) => c.id),
-              sidebarLayout.value,
-            )
-          : reconcileLayout(
-              connections.value.map((c) => c.id),
-              savedLayout ?? currentLayout,
-            );
-        if (!hasPendingLayoutWrite) sidebarLayoutPersisted = JSON.stringify(sidebarLayout.value);
+        const editedWhileReading = layoutRevisionBeforeRead !== sidebarLayoutRevision;
+        sidebarLayout.value =
+          hasPendingLayoutWrite || editedWhileReading
+            ? reconcileLayout(
+                connections.value.map((c) => c.id),
+                sidebarLayout.value,
+              )
+            : reconcileLayout(
+                connections.value.map((c) => c.id),
+                savedLayout ?? currentLayout,
+              );
+        if (hasPendingLayoutWrite || editedWhileReading) {
+          // Keep the live layout, but make sure a poll that started before this
+          // reload cannot adopt the same stale snapshot afterwards.
+          sidebarLayoutRevision += 1;
+        } else {
+          sidebarLayoutRevision += 1;
+          sidebarLayoutPersisted = JSON.stringify(sidebarLayout.value);
+        }
         rebuildTreeNodes();
       })().finally(() => {
         initFromDiskPromise = null;
