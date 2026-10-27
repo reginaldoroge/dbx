@@ -10,7 +10,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
@@ -2912,33 +2912,62 @@ impl DbxMcpServer {
         if !unknown.is_empty() {
             return tool_error("UNKNOWN_CONNECTION", format!("Unknown connection IDs: {}", unknown.join(", ")));
         }
-        let layout = match self.backend.load_sidebar_layout().await {
-            Ok(layout) => layout,
-            Err(error) => return backend_tool_error("SIDEBAR_LOAD_ERROR", error),
-        };
         let spec = SidebarGroupSpec { id: request.group_id, name: request.group };
-        let updated = match move_connections_in_layout(layout.as_ref(), &spec, &request.connection_ids) {
-            Ok(layout) => layout,
-            Err(error) => return sidebar_error(error),
-        };
-        let summary = match describe_layout(Some(&updated)) {
-            Ok(summary) => summary,
-            Err(error) => return sidebar_error(error),
-        };
-        let target = summary.groups.iter().find(|group| {
-            if let Some(id) = spec.id.as_deref() {
-                group.id == id
-            } else {
-                spec.name.as_deref().is_some_and(|name| group.name.trim().eq_ignore_ascii_case(name.trim()))
+        // Read, transform and write under a compare-and-swap: two MCP calls (or an
+        // MCP call and the desktop app) that move different connections must not
+        // report success while one of the moves is silently overwritten.
+        let mut committed: Option<(String, String)> = None;
+        for _ in 0..5 {
+            let raw = match self.backend.load_sidebar_layout_raw().await {
+                Ok(raw) => raw,
+                Err(error) => return backend_tool_error("SIDEBAR_LOAD_ERROR", error),
+            };
+            let layout = match raw.as_deref() {
+                Some(text) => match serde_json::from_str::<Value>(text) {
+                    Ok(layout) => Some(layout),
+                    Err(error) => {
+                        return tool_error(
+                            "INVALID_SIDEBAR_LAYOUT",
+                            format!("the stored sidebar layout is not valid JSON: {error}"),
+                        );
+                    }
+                },
+                None => None,
+            };
+            let updated = match move_connections_in_layout(layout.as_ref(), &spec, &request.connection_ids) {
+                Ok(layout) => layout,
+                Err(error) => return sidebar_error(error),
+            };
+            let summary = match describe_layout(Some(&updated)) {
+                Ok(summary) => summary,
+                Err(error) => return sidebar_error(error),
+            };
+            let target = summary.groups.iter().find(|group| {
+                if let Some(id) = spec.id.as_deref() {
+                    group.id == id
+                } else {
+                    spec.name.as_deref().is_some_and(|name| group.name.trim().eq_ignore_ascii_case(name.trim()))
+                }
+            });
+            let Some(target) = target else {
+                return tool_error("INVALID_SIDEBAR_LAYOUT", "resolved group is missing after the move");
+            };
+            match self.backend.replace_sidebar_layout_if_unchanged(raw.as_deref(), &updated).await {
+                Ok(true) => {
+                    committed = Some((target.name.clone(), target.id.clone()));
+                    break;
+                }
+                Ok(false) => continue,
+                Err(error) => return backend_tool_error("SIDEBAR_SAVE_ERROR", error),
             }
-        });
-        let Some(target) = target else {
-            return tool_error("INVALID_SIDEBAR_LAYOUT", "resolved group is missing after the move");
-        };
-        if let Err(error) = self.backend.save_sidebar_layout(&updated).await {
-            return backend_tool_error("SIDEBAR_SAVE_ERROR", error);
         }
-        let group = format!("{} (id: {})", target.name, target.id);
+        let Some((name, id)) = committed else {
+            return tool_error(
+                "SIDEBAR_LAYOUT_CONFLICT",
+                "The sidebar layout changed while the move was being applied; retry the call.",
+            );
+        };
+        let group = format!("{name} (id: {id})");
         let mut moved_ids = std::collections::HashSet::new();
         let names = request
             .connection_ids
@@ -5824,6 +5853,8 @@ mod tests {
         revoke_on_approval: bool,
         plugin_providers: Vec<crate::plugin_tools::PluginToolProvider>,
         plugin_tool_calls: RecordedPluginToolCalls,
+        /// Number of conditional layout writes that a competing writer wins first.
+        sidebar_write_conflicts: AtomicUsize,
     }
 
     impl Default for FakeBackend {
@@ -5852,6 +5883,7 @@ mod tests {
                 revoke_on_approval: false,
                 plugin_providers: Vec::new(),
                 plugin_tool_calls: std::sync::Mutex::new(Vec::new()),
+                sidebar_write_conflicts: AtomicUsize::new(0),
             }
         }
     }
@@ -6021,6 +6053,26 @@ mod tests {
         async fn save_sidebar_layout(&self, layout: &Value) -> Result<(), String> {
             *self.sidebar_layout.lock().unwrap() = Some(layout.clone());
             Ok(())
+        }
+
+        async fn replace_sidebar_layout_if_unchanged(
+            &self,
+            _expected: Option<&str>,
+            next: &Value,
+        ) -> Result<bool, String> {
+            if self.sidebar_write_conflicts.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                self.sidebar_write_conflicts.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                // Another writer commits between our read and our write.
+                let mut layout = self.sidebar_layout.lock().unwrap();
+                let mut concurrent = layout.clone().unwrap_or_else(|| json!({"groups":[],"order":[]}));
+                if let Some(order) = concurrent["order"].as_array_mut() {
+                    order.push(json!({"type":"connection","id":"concurrent"}));
+                }
+                *layout = Some(concurrent);
+                return Ok(false);
+            }
+            *self.sidebar_layout.lock().unwrap() = Some(next.clone());
+            Ok(true)
         }
 
         async fn list_plugin_mcp_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
@@ -6937,6 +6989,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidebar_move_retries_when_another_writer_wins_the_row() {
+        let backend = Arc::new(FakeBackend {
+            connections: vec![connection("c", "Local", "sqlite", "app")],
+            sidebar_layout: std::sync::Mutex::new(Some(json!({
+                "groups":[{"id":"a","name":"A"}],
+                "order":[{"type":"group","id":"a","children":[]},{"type":"connection","id":"c"}]
+            }))),
+            sidebar_write_conflicts: AtomicUsize::new(1),
+            ..Default::default()
+        });
+        let server = DbxMcpServer::with_runtime_options(backend.clone(), McpScope::default(), false);
+        let result = server
+            .move_connections_to_group(Parameters(MoveConnectionsToGroupRequest {
+                group_id: Some("a".into()),
+                group: None,
+                connection_ids: vec!["c".into()],
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let saved = backend.sidebar_layout.lock().unwrap().clone().unwrap();
+        // The move is re-applied on the fresh row instead of overwriting it.
+        assert!(saved["order"].as_array().unwrap().iter().any(|entry| entry["id"] == "concurrent"));
+        let summary = describe_layout(Some(&saved)).unwrap();
+        assert_eq!(summary.groups[0].connection_ids, ["c"]);
+    }
+
     async fn sidebar_move_saves_and_reports_resolved_group() {
         let backend = Arc::new(FakeBackend {
             connections: vec![connection("c", "Local", "sqlite", "app")],

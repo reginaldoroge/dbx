@@ -166,8 +166,10 @@ pub fn move_connections_in_layout(
     let mut layout = initial(layout)?;
     let id = if let Some(group) = target {
         // The desktop app expands a collapsed group when connections land in it.
+        // Duplicate metadata is last-wins, so every entry for the id is expanded;
+        // otherwise the effective (last) one would stay collapsed after a move.
         if let Some(groups) = layout["groups"].as_array_mut() {
-            if let Some(entry) = groups.iter_mut().find(|entry| entry["id"].as_str() == Some(group.id.as_str())) {
+            for entry in groups.iter_mut().filter(|entry| entry["id"].as_str() == Some(group.id.as_str())) {
                 entry["collapsed"] = json!(false);
             }
         }
@@ -436,5 +438,24 @@ mod tests {
         assert_eq!(summary.groups[0].name, "Second");
         assert!(!summary.groups[0].collapsed);
         assert_eq!(summary.groups[0].connection_ids, ["c1"]);
+    }
+
+    #[test]
+    fn expands_every_duplicate_metadata_entry_of_the_target_group() {
+        let layout = json!({"groups":[
+        {"id":"a","name":"First","collapsed":true},
+        {"id":"a","name":"Second","collapsed":true}],"order":[
+        {"type":"group","id":"a","children":[{"type":"connection","id":"c1"}]}]});
+        let moved = move_connections_in_layout(
+            Some(&layout),
+            &SidebarGroupSpec { id: Some("a".into()), name: None },
+            &["c2".to_string()],
+        )
+        .unwrap();
+        let groups = moved["groups"].as_array().unwrap();
+        assert!(groups.iter().all(|group| group["collapsed"] == json!(false)));
+        let summary = describe_layout(Some(&moved)).unwrap();
+        assert!(!summary.groups[0].collapsed);
+        assert_eq!(summary.groups[0].connection_ids, ["c1", "c2"]);
     }
 }

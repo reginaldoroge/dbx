@@ -303,6 +303,20 @@ pub trait DbxBackend: Send + Sync {
     async fn save_sidebar_layout(&self, _layout: &Value) -> Result<(), String> {
         Err("Sidebar layout is not supported by this backend.".to_string())
     }
+    /// Raw JSON text of the stored layout, used for compare-and-swap writes.
+    async fn load_sidebar_layout_raw(&self) -> Result<Option<String>, String> {
+        self.load_sidebar_layout()
+            .await?
+            .map(|layout| serde_json::to_string(&layout).map_err(|error| error.to_string()))
+            .transpose()
+    }
+    /// Persist `next` only when the stored layout is still `expected`. Backends
+    /// that cannot compare atomically fall back to a plain save, which is the
+    /// best they can do while a single writer owns the row.
+    async fn replace_sidebar_layout_if_unchanged(&self, _expected: Option<&str>, next: &Value) -> Result<bool, String> {
+        self.save_sidebar_layout(next).await?;
+        Ok(true)
+    }
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
         Ok(self
             .load_connection_group_paths()
@@ -1251,6 +1265,14 @@ impl DbxBackend for LocalBackend {
         self.state.storage.save_sidebar_layout(layout).await
     }
 
+    async fn load_sidebar_layout_raw(&self) -> Result<Option<String>, String> {
+        self.state.storage.load_sidebar_layout_raw().await
+    }
+
+    async fn replace_sidebar_layout_if_unchanged(&self, expected: Option<&str>, next: &Value) -> Result<bool, String> {
+        self.state.storage.replace_sidebar_layout_if_unchanged(expected, next).await
+    }
+
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
         self.load_sidebar_layout()
             .await?
@@ -1709,6 +1731,24 @@ impl DbxBackend for WebBackend {
     async fn save_sidebar_layout(&self, layout: &Value) -> Result<(), String> {
         self.request(reqwest::Method::POST, "/api/layout/sidebar", Some(json!({"layout": layout}))).await?;
         Ok(())
+    }
+
+    async fn load_sidebar_layout_raw(&self) -> Result<Option<String>, String> {
+        self.load_sidebar_layout()
+            .await?
+            .map(|layout| serde_json::to_string(&layout).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// The web backend has no conditional write, so re-read right before saving.
+    /// The window is small but not empty; the desktop backend owns the CAS.
+    async fn replace_sidebar_layout_if_unchanged(&self, expected: Option<&str>, next: &Value) -> Result<bool, String> {
+        let current = self.load_sidebar_layout_raw().await?;
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        self.save_sidebar_layout(next).await?;
+        Ok(true)
     }
 
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
