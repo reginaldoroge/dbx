@@ -720,6 +720,8 @@ export const useConnectionStore = defineStore("connection", () => {
   let sidebarLayoutPersistInFlight: Promise<void> | null = null;
   /** Tail of the save chain: writes must land in the order they were issued. */
   let sidebarLayoutSaveChain: Promise<unknown> = Promise.resolve();
+  /** Issued writes, so a rollback knows whether a newer write already won. */
+  let sidebarLayoutSaveVersion = 0;
   /** JSON of the layout we know the storage holds. Anything else in memory is an
    *  unsaved local edit, and a poll that reads the old row must not revert it. */
   let sidebarLayoutPersisted: string | null = null;
@@ -10491,6 +10493,7 @@ export const useConnectionStore = defineStore("connection", () => {
     let connectionsPersisted = false;
     let timeoutSettingsPersisted = false;
     let layoutSaveStarted = false;
+    let layoutSaveVersion = 0;
 
     try {
       if (connectionsChanged) {
@@ -10503,13 +10506,17 @@ export const useConnectionStore = defineStore("connection", () => {
       }
       if (layoutChanged) {
         layoutSaveStarted = true;
-        await queueSidebarLayoutSave(nextLayout);
+        const queued = queueSidebarLayoutSave(nextLayout);
+        layoutSaveVersion = queued.version;
+        await queued.promise;
       }
     } catch (error) {
       const rollbackErrors: unknown[] = [];
-      if (layoutSaveStarted) {
+      // A newer write already reflects a newer decision; restoring the layout we
+      // tried to delete would land after it and undo the user's latest edit.
+      if (layoutSaveStarted && layoutSaveVersion === sidebarLayoutSaveVersion) {
         try {
-          await queueSidebarLayoutSave(previousLayout);
+          await queueSidebarLayoutSave(previousLayout).promise;
         } catch (rollbackError) {
           rollbackErrors.push(rollbackError);
         }
@@ -10598,8 +10605,10 @@ export const useConnectionStore = defineStore("connection", () => {
   /** Writes are serialized, because a save that started earlier must land before
    *  the next one: an older snapshot committing after a newer one would leave the
    *  row stale and the poll would then adopt it over the newer local layout. */
-  function queueSidebarLayoutSave(layout: SidebarLayout): Promise<void> {
+  function queueSidebarLayoutSave(layout: SidebarLayout): { promise: Promise<void>; version: number } {
     sidebarLayoutRevision += 1;
+    sidebarLayoutSaveVersion += 1;
+    const version = sidebarLayoutSaveVersion;
     const snapshot = JSON.stringify(layout);
     const revision = sidebarLayoutRevision;
     const run = () => api.saveSidebarLayout(layout);
@@ -10615,19 +10624,21 @@ export const useConnectionStore = defineStore("connection", () => {
       if (revision === sidebarLayoutRevision) sidebarLayoutPersisted = snapshot;
     });
     sidebarLayoutPersistInFlight = tracked;
+    // Settling is not an edit: bumping the revision here would invalidate the
+    // snapshot of the next queued save, so two overlapping saves would leave the
+    // watermark stale and the poll would refuse to adopt remote changes forever.
     const settle = () => {
       if (sidebarLayoutPersistInFlight === tracked) sidebarLayoutPersistInFlight = null;
-      sidebarLayoutRevision += 1;
     };
     tracked.then(settle, settle);
-    return tracked;
+    return { promise: tracked, version };
   }
 
   function persistSidebarLayoutDebounced() {
     if (layoutPersistTimer) clearTimeout(layoutPersistTimer);
     layoutPersistTimer = setTimeout(() => {
       layoutPersistTimer = null;
-      void queueSidebarLayoutSave(sidebarLayout.value).catch(() => {});
+      void queueSidebarLayoutSave(sidebarLayout.value).promise.catch(() => {});
     }, 300);
   }
 

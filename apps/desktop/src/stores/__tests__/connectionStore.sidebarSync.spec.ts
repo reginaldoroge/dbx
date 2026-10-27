@@ -163,10 +163,17 @@ describe("connectionStore adopting a sidebar layout written elsewhere", () => {
 
     deferred[1].resolve();
     await vi.advanceTimersByTimeAsync(0);
-
-    loadSidebarLayout.mockResolvedValue(ungrouped());
-    await store.syncSidebarLayoutOnce();
     expect(store.groupIdForConnection("a")).toBe(second);
+
+    // The watermark must describe the settled layout, otherwise a genuinely new
+    // external write would never be adopted again.
+    const external: SidebarLayout = {
+      groups: [{ id: "ext", name: "Ext", collapsed: false }],
+      order: [{ type: "group", id: "ext", children: [{ type: "connection", id: "a" }] }],
+    };
+    loadSidebarLayout.mockResolvedValue(external);
+    await store.syncSidebarLayoutOnce();
+    expect(store.groupIdForConnection("a")).toBe("ext");
     vi.useRealTimers();
   });
 
