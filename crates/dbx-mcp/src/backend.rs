@@ -1745,7 +1745,11 @@ impl DbxBackend for WebBackend {
 
     async fn replace_sidebar_layout_if_unchanged(&self, expected: Option<&str>, next: &Value) -> Result<bool, String> {
         let response = self
-            .request(reqwest::Method::POST, "/api/layout/sidebar", Some(json!({"layout": next, "expected": expected})))
+            .request(
+                reqwest::Method::POST,
+                "/api/layout/sidebar",
+                Some(json!({"layout": next, "expected": expected, "conditional": true})),
+            )
             .await?;
         let body = response.json::<Value>().await.map_err(|error| format!("Invalid sidebar save response: {error}"))?;
         Ok(body.get("applied").and_then(Value::as_bool).unwrap_or(false))

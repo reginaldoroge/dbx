@@ -11,11 +11,13 @@ use crate::state::WebState;
 #[serde(rename_all = "camelCase")]
 pub struct SaveLayoutRequest {
     pub layout: serde_json::Value,
-    /// Raw layout text the caller read before transforming it. When present the
-    /// write only lands if the row still holds it, so two clients cannot silently
-    /// overwrite each other's move.
+    /// Raw layout text the caller read before transforming it. Only consulted
+    /// when `conditional` is set; `None` then means "the row must still be
+    /// absent", which is different from a plain unconditional write.
     #[serde(default)]
     pub expected: Option<String>,
+    #[serde(default)]
+    pub conditional: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -27,17 +29,16 @@ pub async fn save_sidebar_layout(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveLayoutRequest>,
 ) -> Result<Json<SaveLayoutResponse>, AppError> {
-    let applied = match body.expected.as_deref() {
-        Some(expected) => state
+    let applied = if body.conditional {
+        state
             .app
             .storage
-            .replace_sidebar_layout_if_unchanged(Some(expected), &body.layout)
+            .replace_sidebar_layout_if_unchanged(body.expected.as_deref(), &body.layout)
             .await
-            .map_err(AppError::from)?,
-        None => {
-            state.app.storage.save_sidebar_layout(&body.layout).await.map_err(AppError::from)?;
-            true
-        }
+            .map_err(AppError::from)?
+    } else {
+        state.app.storage.save_sidebar_layout(&body.layout).await.map_err(AppError::from)?;
+        true
     };
     Ok(Json(SaveLayoutResponse { applied }))
 }
