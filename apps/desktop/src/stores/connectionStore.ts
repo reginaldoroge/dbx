@@ -4587,8 +4587,8 @@ export const useConnectionStore = defineStore("connection", () => {
     const nextConnections = connections.value.filter((c) => !removedIds.has(c.id));
     let nextLayout = sidebarLayout.value;
     for (const id of removedIds) nextLayout = removeConnectionFromSidebarLayout(nextLayout, id);
-    await persistConnectionDeletion(nextConnections, nextLayout);
-    applyConnectionRemoval(removedIds, nextConnections, nextLayout);
+    const appliedLayout = await persistConnectionDeletion(nextConnections, (layout) => [...removedIds].reduce((current, id) => removeConnectionFromSidebarLayout(current, id), layout));
+    applyConnectionRemoval(removedIds, nextConnections, appliedLayout);
     // 连接已不存在，"用户已关闭"标记没有意义，留着只会泄漏失效 id。
     for (const id of removedIds) clearConnectionClosedByUser(id);
     purgeTableVGroupsForConnections(removedIds);
@@ -10476,7 +10476,10 @@ export const useConnectionStore = defineStore("connection", () => {
     });
   }
 
-  async function persistConnectionDeletion(nextConnections: ConnectionConfig[], nextLayout: SidebarLayout) {
+  // Applies the deletion while the connection rows are being persisted, because a
+  // sidebar edit that lands in between must not be overwritten by a snapshot this
+  // call captured before its awaits.
+  async function persistConnectionDeletion(nextConnections: ConnectionConfig[], applyLayout: (layout: SidebarLayout) => SidebarLayout): Promise<SidebarLayout> {
     const previousConnections = connections.value;
     const previousLayout = sidebarLayout.value;
     const previousConnectTimeoutIds = [...settingsStore.editorSettings.connectTimeoutInheritConnectionIds];
@@ -10489,7 +10492,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const nextConnectionIds = new Set(nextConnections.map((connection) => connection.id));
     const removedConnectionIds = previousConnections.filter((connection) => !nextConnectionIds.has(connection.id)).map((connection) => connection.id);
     const timeoutSettingsChanged = !sameIds(nextConnectTimeoutIds, previousConnectTimeoutIds) || !sameIds(nextQueryTimeoutIds, previousQueryTimeoutIds);
-    const layoutChanged = nextLayout !== previousLayout;
+    let appliedLayout = previousLayout;
     let connectionsPersisted = false;
     let timeoutSettingsPersisted = false;
     let layoutSaveStarted = false;
@@ -10504,11 +10507,13 @@ export const useConnectionStore = defineStore("connection", () => {
         await persistTimeoutInheritanceIds(nextConnectTimeoutIds, nextQueryTimeoutIds);
         timeoutSettingsPersisted = true;
       }
-      if (layoutChanged) {
+      const targetLayout = applyLayout(sidebarLayout.value);
+      if (targetLayout !== sidebarLayout.value) {
         layoutSaveStarted = true;
-        const queued = queueSidebarLayoutSave(nextLayout);
+        const queued = queueSidebarLayoutSave(targetLayout);
         layoutSaveVersion = queued.version;
         await queued.promise;
+        appliedLayout = targetLayout;
       }
     } catch (error) {
       const rollbackErrors: unknown[] = [];
@@ -10543,6 +10548,7 @@ export const useConnectionStore = defineStore("connection", () => {
       }
       throw error;
     }
+    return appliedLayout;
   }
 
   async function applyGlobalTimeouts({ connectTimeoutSecs, queryTimeoutSecs }: { connectTimeoutSecs?: number; queryTimeoutSecs?: number }) {
@@ -10612,12 +10618,26 @@ export const useConnectionStore = defineStore("connection", () => {
     const snapshot = JSON.stringify(layout);
     const revision = sidebarLayoutRevision;
     const run = () => api.saveSidebarLayout(layout);
-    const save = sidebarLayoutSaveChain.then(run, run);
-    sidebarLayoutSaveChain = save.then(
-      () => undefined,
-      () => undefined,
-    );
-    const tracked = save.then(() => {
+    // A write that fails once is retried before the guard opens again: the poll
+    // only adopts remote layouts while memory matches the disk, so a save that
+    // never retries would freeze external sync until the next local edit.
+    const write = (retriesLeft: number): Promise<void> => {
+      const save = sidebarLayoutSaveChain.then(run, run);
+      sidebarLayoutSaveChain = save.then(
+        () => undefined,
+        () => undefined,
+      );
+      return save.catch((error: unknown) => {
+        if (retriesLeft === 0 || version !== sidebarLayoutSaveVersion) throw error;
+        return new Promise<void>((resolve) => {
+          layoutPersistTimer = setTimeout(() => {
+            layoutPersistTimer = null;
+            resolve();
+          }, 1000);
+        }).then(() => write(retriesLeft - 1));
+      });
+    };
+    const tracked = write(1).then(() => {
       // Only a save that still describes the current layout counts as persisted;
       // if the user edited meanwhile, the guard stays closed until the follow-up
       // save lands.
@@ -10913,10 +10933,14 @@ export const useConnectionStore = defineStore("connection", () => {
     const nextConnections = removedConnectionIds.size ? connections.value.filter((connection) => !removedConnectionIds.has(connection.id)) : connections.value;
     let layoutAfterConnectionRemoval = previousLayout;
     for (const id of removedConnectionIds) layoutAfterConnectionRemoval = removeConnectionFromSidebarLayout(layoutAfterConnectionRemoval, id);
-    const nextLayout = deleteGroupsOp(layoutAfterConnectionRemoval, uniqueGroupIds);
+    let nextLayout = deleteGroupsOp(layoutAfterConnectionRemoval, uniqueGroupIds);
     if (nextLayout === previousLayout && nextConnections === connections.value) return [];
 
-    await persistConnectionDeletion(nextConnections, nextLayout);
+    nextLayout = await persistConnectionDeletion(nextConnections, (layout) => {
+      let next = layout;
+      for (const id of removedConnectionIds) next = removeConnectionFromSidebarLayout(next, id);
+      return deleteGroupsOp(next, uniqueGroupIds);
+    });
     if (removedConnectionIds.size) {
       applyConnectionRemoval(removedConnectionIds, nextConnections, nextLayout);
       purgeTableVGroupsForConnections(removedConnectionIds);

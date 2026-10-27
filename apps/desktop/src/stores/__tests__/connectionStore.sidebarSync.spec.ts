@@ -49,6 +49,8 @@ describe("connectionStore adopting a sidebar layout written elsewhere", () => {
       saveEditorSettings: vi.fn().mockResolvedValue(undefined),
       loadSidebarLayout,
       saveSidebarLayout,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      deleteTableVGroupsForConnection: vi.fn().mockResolvedValue(undefined),
     }));
     setActivePinia(createPinia());
   });
@@ -174,6 +176,70 @@ describe("connectionStore adopting a sidebar layout written elsewhere", () => {
     loadSidebarLayout.mockResolvedValue(external);
     await store.syncSidebarLayoutOnce();
     expect(store.groupIdForConnection("a")).toBe("ext");
+    vi.useRealTimers();
+  });
+
+  it("keeps a sidebar edit that lands while a deletion is persisting", async () => {
+    vi.useFakeTimers();
+    const store = await storeWithFlatLayout();
+    store.connections = [connection("a"), connection("b")];
+    store.sidebarLayout = {
+      groups: [],
+      order: [
+        { type: "connection", id: "a" },
+        { type: "connection", id: "b" },
+      ],
+    };
+    loadSidebarLayout.mockResolvedValue(null);
+    await store.syncSidebarLayoutOnce();
+
+    const api = await import("@/lib/backend/api");
+    let resolveConnections: () => void = () => {};
+    (api.saveConnections as Mock).mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveConnections = resolve;
+      }),
+    );
+
+    const deletion = store.removeConnections(["a"]);
+    // The user groups "b" while the connection rows are still being written. The
+    // deletion must apply to the layout as it stands now, not to the snapshot it
+    // captured before that edit.
+    const groupId = store.createConnectionGroup("G");
+    store.moveConnectionToGroup("b", groupId);
+    resolveConnections();
+    await deletion;
+    await vi.advanceTimersByTimeAsync(300);
+
+    const saved = saveSidebarLayout.mock.calls.at(-1)?.[0] as SidebarLayout;
+    expect(saved.groups.map((group) => group.name)).toEqual(["G"]);
+    expect(store.groupIdForConnection("b")).toBe(groupId);
+    vi.useRealTimers();
+  });
+
+  it("retries a failed save so external changes can still be adopted", async () => {
+    vi.useFakeTimers();
+    const store = await storeWithFlatLayout();
+    loadSidebarLayout.mockResolvedValue(ungrouped());
+    await store.syncSidebarLayoutOnce();
+
+    saveSidebarLayout.mockRejectedValueOnce(new Error("disk unavailable"));
+    store.moveConnectionToGroup("a", store.createConnectionGroup("G"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(saveSidebarLayout).toHaveBeenCalledTimes(1);
+
+    // The retry keeps the watermark honest, so the poll is not blocked by the
+    // failed write forever.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(saveSidebarLayout).toHaveBeenCalledTimes(2);
+
+    const remote: SidebarLayout = {
+      groups: [{ id: "other", name: "Other", collapsed: false }],
+      order: [{ type: "group", id: "other", children: [{ type: "connection", id: "a" }] }],
+    };
+    loadSidebarLayout.mockResolvedValue(remote);
+    await store.syncSidebarLayoutOnce();
+    expect(store.groupIdForConnection("a")).toBe("other");
     vi.useRealTimers();
   });
 
