@@ -2851,8 +2851,14 @@ impl DbxMcpServer {
         let mut lines = Vec::new();
         for group in summary.groups {
             // Members hidden by the MCP policy never reach the caller, not even as bare IDs.
+            let member_count = group.connection_ids.len();
             let members =
                 group.connection_ids.into_iter().filter(|id| visible.contains(id.as_str())).collect::<Vec<_>>();
+            // A group whose members are all hidden is itself hidden: reporting its
+            // name would leak the shape of the sidebar the policy is withholding.
+            if member_count > 0 && members.is_empty() {
+                continue;
+            }
             grouped.extend(members.iter().cloned());
             lines.push(format!(
                 "{} (id: {}, collapsed: {}, {} members): {}",
@@ -7062,6 +7068,25 @@ mod tests {
         // A member the policy cannot see is not reported, not even as a bare id.
         assert!(output.contains("A (id: a, collapsed: true, 1 members): Local (c)"), "{output}");
         assert!(output.contains("Ungrouped: Root (root)"));
+    }
+
+    #[tokio::test]
+    async fn sidebar_list_hides_groups_whose_members_are_all_hidden() {
+        let backend = Arc::new(FakeBackend {
+            connections: vec![connection("c", "Local", "sqlite", "app")],
+            sidebar_layout: std::sync::Mutex::new(Some(json!({
+                "groups":[{"id":"a","name":"Secret","collapsed":false},{"id":"b","name":"Empty","collapsed":false}],
+                "order":[{"type":"group","id":"a","children":[{"type":"connection","id":"hidden"}]},
+                    {"type":"group","id":"b","children":[]},{"type":"connection","id":"c"}]
+            }))),
+            ..Default::default()
+        });
+        let server = DbxMcpServer::with_runtime_options(backend, McpScope::default(), false);
+        let listed = server.list_sidebar_groups().await;
+        let output = result_text(&listed);
+        assert!(!output.contains("Secret"), "{output}");
+        // A group that is empty in the layout has no member to leak.
+        assert!(output.contains("Empty (id: b, collapsed: false, 0 members)"), "{output}");
     }
 
     #[tokio::test]
