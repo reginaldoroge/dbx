@@ -46,19 +46,22 @@ fn initial(layout: Option<&Value>) -> Result<Value, String> {
 pub fn describe_layout(layout: Option<&Value>) -> Result<SidebarSummary, String> {
     let layout = initial(layout)?;
     let metadata = layout["groups"].as_array().ok_or_else(|| invalid("groups must be an array"))?;
-    let mut groups = Vec::new();
-    let mut ids = HashSet::new();
+    let mut groups: Vec<SidebarGroupInfo> = Vec::new();
     for group in metadata {
         let id = group["id"].as_str().ok_or_else(|| invalid("group id must be a string"))?;
         let name = group["name"].as_str().ok_or_else(|| invalid("group name must be a string"))?;
-        if !ids.insert(id) {
-            return Err(invalid("duplicate group id"));
-        }
         let collapsed = match group.get("collapsed") {
             None => false,
             Some(value) => value.as_bool().ok_or_else(|| invalid("collapsed must be a boolean"))?,
         };
-        groups.push(SidebarGroupInfo { id: id.into(), name: name.into(), collapsed, connection_ids: Vec::new() });
+        let info = SidebarGroupInfo { id: id.into(), name: name.into(), collapsed, connection_ids: Vec::new() };
+        // The policy resolver collects group metadata into a HashMap, so a stray
+        // duplicate id is last-wins there. Matching that keeps a malformed import
+        // from failing only in the tools that list groups.
+        match groups.iter_mut().find(|group| group.id == id) {
+            Some(existing) => *existing = info,
+            None => groups.push(info),
+        }
     }
     let mut seen = HashSet::new();
     let ungrouped = inspect_entries(&layout["order"], &mut groups, &mut seen, true)?;
@@ -324,7 +327,6 @@ mod tests {
             json!([]),
             json!({"groups":null}),
             json!({"order":[{"type":"group","id":"missing"}]}),
-            json!({"groups":[{"id":"a","name":"A"},{"id":"a","name":"B"}]}),
             json!({"order":[{"type":"other","id":"x"}]}),
             json!({"groups":[{"id":"a","name":"A"}],"order":[{"type":"group","id":"a","children":false}]}),
         ] {
@@ -419,5 +421,20 @@ mod tests {
             moved["order"][0]["children"],
             json!([{"type":"connection","id":"keep"},{"type":"connection","id":"moved"}])
         );
+    }
+
+    #[test]
+    fn duplicate_group_metadata_is_last_wins() {
+        let layout = json!({"groups":[
+        {"id":"a","name":"First","collapsed":true},
+        {"id":"a","name":"Second","collapsed":false}],"order":[
+        {"type":"group","id":"a","children":[{"type":"connection","id":"c1"}]}]});
+        // connection_group_paths collects metadata into a HashMap (last wins), so the
+        // read path must not turn the same layout into INVALID_SIDEBAR_LAYOUT.
+        let summary = describe_layout(Some(&layout)).unwrap();
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].name, "Second");
+        assert!(!summary.groups[0].collapsed);
+        assert_eq!(summary.groups[0].connection_ids, ["c1"]);
     }
 }
