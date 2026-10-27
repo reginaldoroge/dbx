@@ -265,3 +265,65 @@ describe("connectionStore adopting a sidebar layout written elsewhere", () => {
     vi.useRealTimers();
   });
 });
+
+describe("connectionStore deleting a connection while the layout changes", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+    });
+    loadSidebarLayout = vi.fn().mockResolvedValue(null);
+    saveSidebarLayout = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      loadEditorSettings: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveEditorSettings: vi.fn().mockResolvedValue(undefined),
+      loadSidebarLayout,
+      saveSidebarLayout,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      deleteTableVGroupsForConnection: vi.fn().mockResolvedValue(undefined),
+    }));
+    setActivePinia(createPinia());
+  });
+
+  it("keeps a grouping edit made while the delete write was in flight", async () => {
+    vi.resetModules();
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [connection("a"), connection("b")];
+    store.sidebarLayout = {
+      groups: [],
+      order: [
+        { type: "connection", id: "a" },
+        { type: "connection", id: "b" },
+      ],
+    } as SidebarLayout;
+
+    const saving: Array<() => void> = [];
+    saveSidebarLayout.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          saving.push(resolve);
+        }),
+    );
+    const settle = async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      for (const resolve of saving.splice(0)) resolve();
+    };
+
+    const deleting = store.removeConnections(["b"]);
+    // The user creates a group while the delete is still being written.
+    const groupId = store.createConnectionGroup("G");
+    await settle();
+    await settle();
+    await deleting;
+
+    // The deletion is applied on top of the edit, not over it.
+    expect(store.sidebarLayout.groups.some((group) => group.id === groupId)).toBe(true);
+    expect(store.connections.some((c) => c.id === "b")).toBe(false);
+  });
+});

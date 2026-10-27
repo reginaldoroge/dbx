@@ -715,6 +715,7 @@ export const useConnectionStore = defineStore("connection", () => {
     return connectionGroupIdForSelection(sidebarLayout.value, selectedNodeId, selectedNode?.connectionId);
   });
   let layoutPersistTimer: ReturnType<typeof setTimeout> | null = null;
+  let sidebarLayoutRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let sidebarLayoutSyncTimer: ReturnType<typeof setInterval> | null = null;
   let sidebarLayoutSyncInFlight = false;
   let sidebarLayoutPersistInFlight: Promise<void> | null = null;
@@ -4587,8 +4588,11 @@ export const useConnectionStore = defineStore("connection", () => {
     const nextConnections = connections.value.filter((c) => !removedIds.has(c.id));
     let nextLayout = sidebarLayout.value;
     for (const id of removedIds) nextLayout = removeConnectionFromSidebarLayout(nextLayout, id);
-    const appliedLayout = await persistConnectionDeletion(nextConnections, (layout) => [...removedIds].reduce((current, id) => removeConnectionFromSidebarLayout(current, id), layout));
-    applyConnectionRemoval(removedIds, nextConnections, appliedLayout);
+    const applyDeletion = (layout: SidebarLayout) => [...removedIds].reduce((current, id) => removeConnectionFromSidebarLayout(current, id), layout);
+    await persistConnectionDeletion(nextConnections, applyDeletion);
+    // Re-apply against the live layout: an edit that landed while the write was in
+    // flight must survive, and removing connections is a pure transform of the tree.
+    applyConnectionRemoval(removedIds, nextConnections, applyDeletion(sidebarLayout.value));
     // 连接已不存在，"用户已关闭"标记没有意义，留着只会泄漏失效 id。
     for (const id of removedIds) clearConnectionClosedByUser(id);
     purgeTableVGroupsForConnections(removedIds);
@@ -10629,15 +10633,22 @@ export const useConnectionStore = defineStore("connection", () => {
       );
       return save.catch((error: unknown) => {
         if (retriesLeft === 0 || version !== sidebarLayoutSaveVersion) throw error;
-        return new Promise<void>((resolve) => {
-          layoutPersistTimer = setTimeout(() => {
-            layoutPersistTimer = null;
+        return new Promise<void>((resolve, reject) => {
+          // The retry must not share the debounce timer: a new edit would clear it,
+          // leaving this promise pending and an awaiting deletion hung.
+          if (sidebarLayoutRetryTimer) clearTimeout(sidebarLayoutRetryTimer);
+          sidebarLayoutRetryTimer = setTimeout(() => {
+            sidebarLayoutRetryTimer = null;
+            if (version !== sidebarLayoutSaveVersion) {
+              reject(error);
+              return;
+            }
             resolve();
           }, 1000);
         }).then(() => write(retriesLeft - 1));
       });
     };
-    const tracked = write(1).then(() => {
+    const tracked = write(3).then(() => {
       // Only a save that still describes the current layout counts as persisted;
       // if the user edited meanwhile, the guard stays closed until the follow-up
       // save lands.
@@ -10917,6 +10928,10 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function updateLayoutAndRebuild(nextLayout: SidebarLayout) {
+    // Bump before touching the layout: a poll that started while this edit was in
+    // flight must not be allowed to overwrite it just because the debounce has not
+    // fired yet.
+    sidebarLayoutRevision += 1;
     sidebarLayout.value = nextLayout;
     rebuildTreeNodes();
     persistSidebarLayoutDebounced();
@@ -10936,11 +10951,13 @@ export const useConnectionStore = defineStore("connection", () => {
     let nextLayout = deleteGroupsOp(layoutAfterConnectionRemoval, uniqueGroupIds);
     if (nextLayout === previousLayout && nextConnections === connections.value) return [];
 
-    nextLayout = await persistConnectionDeletion(nextConnections, (layout) => {
+    const applyGroupDeletion = (layout: SidebarLayout) => {
       let next = layout;
       for (const id of removedConnectionIds) next = removeConnectionFromSidebarLayout(next, id);
       return deleteGroupsOp(next, uniqueGroupIds);
-    });
+    };
+    await persistConnectionDeletion(nextConnections, applyGroupDeletion);
+    nextLayout = applyGroupDeletion(sidebarLayout.value);
     if (removedConnectionIds.size) {
       applyConnectionRemoval(removedConnectionIds, nextConnections, nextLayout);
       purgeTableVGroupsForConnections(removedConnectionIds);
@@ -11455,11 +11472,20 @@ export const useConnectionStore = defineStore("connection", () => {
         tableVGroupLayouts.value = Object.fromEntries(Object.entries(loadedTableVGroups ?? {}).map(([scopeKey, layout]) => [scopeKey, normalizeTableVGroupLayoutOp(layout)]));
         const savedLayout = await api.loadSidebarLayout();
         const currentLayout = sidebarLayout.value.groups.length || sidebarLayout.value.order.length ? sidebarLayout.value : null;
-        sidebarLayout.value = reconcileLayout(
-          connections.value.map((c) => c.id),
-          savedLayout ?? currentLayout,
-        );
-        sidebarLayoutPersisted = JSON.stringify(sidebarLayout.value);
+        // A reload must not swallow an edit that is still sitting in the debounce or
+        // in an in-flight write: the disk snapshot predates it, so keep the live
+        // layout and let the pending save (or the poll) settle the row.
+        const hasPendingLayoutWrite = layoutPersistTimer !== null || sidebarLayoutPersistInFlight !== null;
+        sidebarLayout.value = hasPendingLayoutWrite
+          ? reconcileLayout(
+              connections.value.map((c) => c.id),
+              sidebarLayout.value,
+            )
+          : reconcileLayout(
+              connections.value.map((c) => c.id),
+              savedLayout ?? currentLayout,
+            );
+        if (!hasPendingLayoutWrite) sidebarLayoutPersisted = JSON.stringify(sidebarLayout.value);
         rebuildTreeNodes();
       })().finally(() => {
         initFromDiskPromise = null;
