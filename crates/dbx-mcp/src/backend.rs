@@ -297,6 +297,12 @@ pub trait DbxBackend: Send + Sync {
     async fn load_connection_group_paths(&self) -> Result<HashMap<String, Vec<String>>, String> {
         Ok(HashMap::new())
     }
+    async fn load_sidebar_layout(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    async fn save_sidebar_layout(&self, _layout: &Value) -> Result<(), String> {
+        Err("Sidebar layout is not supported by this backend.".to_string())
+    }
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
         Ok(self
             .load_connection_group_paths()
@@ -1237,10 +1243,16 @@ impl DbxBackend for LocalBackend {
             .collect())
     }
 
+    async fn load_sidebar_layout(&self) -> Result<Option<Value>, String> {
+        self.state.storage.load_sidebar_layout().await
+    }
+
+    async fn save_sidebar_layout(&self, layout: &Value) -> Result<(), String> {
+        self.state.storage.save_sidebar_layout(layout).await
+    }
+
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
-        self.state
-            .storage
-            .load_sidebar_layout()
+        self.load_sidebar_layout()
             .await?
             .as_ref()
             .map(connection_group_paths)
@@ -1686,14 +1698,26 @@ impl DbxBackend for WebBackend {
             .collect())
     }
 
-    async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
-        let layout = self
-            .request(reqwest::Method::GET, "/api/layout/sidebar", None)
+    async fn load_sidebar_layout(&self) -> Result<Option<Value>, String> {
+        self.request(reqwest::Method::GET, "/api/layout/sidebar", None)
             .await?
             .json::<Option<Value>>()
             .await
-            .map_err(|error| format!("Invalid sidebar layout response: {error}"))?;
-        layout.as_ref().map(connection_group_paths).transpose().map(Option::unwrap_or_default)
+            .map_err(|error| format!("Invalid sidebar layout response: {error}"))
+    }
+
+    async fn save_sidebar_layout(&self, layout: &Value) -> Result<(), String> {
+        self.request(reqwest::Method::POST, "/api/layout/sidebar", Some(json!({"layout": layout}))).await?;
+        Ok(())
+    }
+
+    async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
+        self.load_sidebar_layout()
+            .await?
+            .as_ref()
+            .map(connection_group_paths)
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 
     async fn execute_agent_tool(
