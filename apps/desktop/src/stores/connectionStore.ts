@@ -715,6 +715,18 @@ export const useConnectionStore = defineStore("connection", () => {
     return connectionGroupIdForSelection(sidebarLayout.value, selectedNodeId, selectedNode?.connectionId);
   });
   let layoutPersistTimer: ReturnType<typeof setTimeout> | null = null;
+  let sidebarLayoutSyncTimer: ReturnType<typeof setInterval> | null = null;
+  let sidebarLayoutSyncInFlight = false;
+  let sidebarLayoutPersistInFlight: Promise<void> | null = null;
+  /** JSON of the layout we know the storage holds. Anything else in memory is an
+   *  unsaved local edit, and a poll that reads the old row must not revert it. */
+  let sidebarLayoutPersisted: string | null = null;
+  /** Bumped by every local edit, persist and adoption. A poll that started in an
+   *  older revision is discarded instead of reverting what changed meanwhile. */
+  let sidebarLayoutRevision = 0;
+  let sidebarLayoutSyncTarget: Window | null = null;
+  let sidebarLayoutSyncDocument: Document | null = null;
+  let sidebarLayoutSyncTick: (() => void) | null = null;
   const staleTreeRefreshIds = new Set<string>();
   const activeTreeRefreshGenerations = new Map<string, number>();
   let nextTreeRefreshGeneration = 0;
@@ -10582,11 +10594,104 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function persistSidebarLayoutDebounced() {
+    sidebarLayoutRevision += 1;
     if (layoutPersistTimer) clearTimeout(layoutPersistTimer);
     layoutPersistTimer = setTimeout(() => {
-      api.saveSidebarLayout(sidebarLayout.value).catch(() => {});
       layoutPersistTimer = null;
+      const snapshot = JSON.stringify(sidebarLayout.value);
+      const revision = sidebarLayoutRevision;
+      const pending: Promise<void> = api
+        .saveSidebarLayout(sidebarLayout.value)
+        .then(() => {
+          // Only a save that still describes the current layout counts as
+          // persisted; if the user edited meanwhile, the guard stays closed
+          // until the follow-up save lands.
+          if (revision === sidebarLayoutRevision) sidebarLayoutPersisted = snapshot;
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (sidebarLayoutPersistInFlight === pending) sidebarLayoutPersistInFlight = null;
+          sidebarLayoutRevision += 1;
+        });
+      sidebarLayoutPersistInFlight = pending;
     }, 300);
+  }
+
+  /** Read the persisted layout once and adopt it when another process (MCP
+   *  server, CLI, another window) rewrote it. Exported through the store so the
+   *  ordering rules below are covered by a spec instead of by a live timer.
+   *
+   *  A poll never wins over a local edit: it is skipped while a persist is
+   *  queued or in flight, discarded when anything bumped the revision during the
+   *  read, and ignored when memory holds a layout the storage does not have yet. */
+  async function syncSidebarLayoutOnce(): Promise<void> {
+    if (sidebarLayoutSyncInFlight || layoutPersistTimer || sidebarLayoutPersistInFlight) return;
+    const revision = sidebarLayoutRevision;
+    const local = JSON.stringify(sidebarLayout.value);
+    if (sidebarLayoutPersisted !== null && local !== sidebarLayoutPersisted) return;
+    sidebarLayoutSyncInFlight = true;
+    try {
+      const remote = await api.loadSidebarLayout();
+      if (!remote || revision !== sidebarLayoutRevision) return;
+      const remoteJson = JSON.stringify(remote);
+      if (remoteJson === local) {
+        sidebarLayoutPersisted = local;
+        return;
+      }
+      const reconciled = reconcileLayout(
+        connections.value.map((c) => c.id),
+        remote,
+      );
+      const next = JSON.stringify(reconciled);
+      if (next === local) {
+        sidebarLayoutPersisted = local;
+        return;
+      }
+      sidebarLayoutRevision += 1;
+      sidebarLayout.value = reconciled;
+      sidebarLayoutPersisted = next;
+      rebuildTreeNodes();
+    } catch {
+      // Transient read failures are expected while another process rewrites the layout.
+    } finally {
+      sidebarLayoutSyncInFlight = false;
+    }
+  }
+
+  /** Watch for layout changes made outside the app. The interval only runs while
+   *  the window is visible, and a focus change syncs immediately, so a hidden
+   *  window or the web build does not poll in the background forever. */
+  function startSidebarLayoutSync(intervalMs = 1500) {
+    if (import.meta.env.MODE === "test") return;
+    if (sidebarLayoutSyncTimer) return;
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      void syncSidebarLayoutOnce();
+    };
+    sidebarLayoutSyncTick = tick;
+    sidebarLayoutSyncTimer = setInterval(tick, intervalMs);
+    if (typeof window !== "undefined") {
+      sidebarLayoutSyncTarget = window;
+      sidebarLayoutSyncTarget.addEventListener("focus", tick);
+    }
+    if (typeof document !== "undefined") {
+      sidebarLayoutSyncDocument = document;
+      sidebarLayoutSyncDocument.addEventListener("visibilitychange", tick);
+    }
+  }
+
+  function stopSidebarLayoutSync() {
+    if (sidebarLayoutSyncTimer) clearInterval(sidebarLayoutSyncTimer);
+    sidebarLayoutSyncTimer = null;
+    if (sidebarLayoutSyncTarget && sidebarLayoutSyncTick) {
+      sidebarLayoutSyncTarget.removeEventListener("focus", sidebarLayoutSyncTick);
+    }
+    sidebarLayoutSyncTarget = null;
+    if (sidebarLayoutSyncDocument && sidebarLayoutSyncTick) {
+      sidebarLayoutSyncDocument.removeEventListener("visibilitychange", sidebarLayoutSyncTick);
+    }
+    sidebarLayoutSyncDocument = null;
+    sidebarLayoutSyncTick = null;
   }
 
   /** 表分组的 scope 一律从「解析到的容器」派生：simple 显示模式下表行带 schema
@@ -11305,12 +11410,14 @@ export const useConnectionStore = defineStore("connection", () => {
           connections.value.map((c) => c.id),
           savedLayout ?? currentLayout,
         );
+        sidebarLayoutPersisted = JSON.stringify(sidebarLayout.value);
         rebuildTreeNodes();
       })().finally(() => {
         initFromDiskPromise = null;
       });
     }
     await initFromDiskPromise;
+    startSidebarLayoutSync();
   }
 
   function addEphemeralConnection(config: ConnectionConfig) {
@@ -11349,6 +11456,8 @@ export const useConnectionStore = defineStore("connection", () => {
     refreshAllTree,
     reloadFromDisk,
     collapseAllTreeNodes,
+    syncSidebarLayoutOnce,
+    stopSidebarLayoutSync,
     refreshSidebarObjectPagination,
     refreshTreeNode,
     refreshConnectionTreeNode,
