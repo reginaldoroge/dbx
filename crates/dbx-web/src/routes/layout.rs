@@ -11,14 +11,35 @@ use crate::state::WebState;
 #[serde(rename_all = "camelCase")]
 pub struct SaveLayoutRequest {
     pub layout: serde_json::Value,
+    /// Raw layout text the caller read before transforming it. When present the
+    /// write only lands if the row still holds it, so two clients cannot silently
+    /// overwrite each other's move.
+    #[serde(default)]
+    pub expected: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SaveLayoutResponse {
+    pub applied: bool,
 }
 
 pub async fn save_sidebar_layout(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveLayoutRequest>,
-) -> Result<Json<()>, AppError> {
-    state.app.storage.save_sidebar_layout(&body.layout).await.map_err(AppError::from)?;
-    Ok(Json(()))
+) -> Result<Json<SaveLayoutResponse>, AppError> {
+    let applied = match body.expected.as_deref() {
+        Some(expected) => state
+            .app
+            .storage
+            .replace_sidebar_layout_if_unchanged(Some(expected), &body.layout)
+            .await
+            .map_err(AppError::from)?,
+        None => {
+            state.app.storage.save_sidebar_layout(&body.layout).await.map_err(AppError::from)?;
+            true
+        }
+    };
+    Ok(Json(SaveLayoutResponse { applied }))
 }
 
 pub async fn load_sidebar_layout(State(state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, AppError> {

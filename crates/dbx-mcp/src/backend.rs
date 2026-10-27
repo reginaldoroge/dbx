@@ -311,11 +311,14 @@ pub trait DbxBackend: Send + Sync {
             .transpose()
     }
     /// Persist `next` only when the stored layout is still `expected`. Backends
-    /// that cannot compare atomically fall back to a plain save, which is the
-    /// best they can do while a single writer owns the row.
-    async fn replace_sidebar_layout_if_unchanged(&self, _expected: Option<&str>, next: &Value) -> Result<bool, String> {
-        self.save_sidebar_layout(next).await?;
-        Ok(true)
+    /// without a conditional write must say so instead of reporting a success
+    /// they cannot guarantee.
+    async fn replace_sidebar_layout_if_unchanged(
+        &self,
+        _expected: Option<&str>,
+        _next: &Value,
+    ) -> Result<bool, String> {
+        Err("Conditional sidebar layout writes are not supported by this backend.".to_string())
     }
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
         Ok(self
@@ -1740,15 +1743,12 @@ impl DbxBackend for WebBackend {
             .transpose()
     }
 
-    /// The web backend has no conditional write, so re-read right before saving.
-    /// The window is small but not empty; the desktop backend owns the CAS.
     async fn replace_sidebar_layout_if_unchanged(&self, expected: Option<&str>, next: &Value) -> Result<bool, String> {
-        let current = self.load_sidebar_layout_raw().await?;
-        if current.as_deref() != expected {
-            return Ok(false);
-        }
-        self.save_sidebar_layout(next).await?;
-        Ok(true)
+        let response = self
+            .request(reqwest::Method::POST, "/api/layout/sidebar", Some(json!({"layout": next, "expected": expected})))
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| format!("Invalid sidebar save response: {error}"))?;
+        Ok(body.get("applied").and_then(Value::as_bool).unwrap_or(false))
     }
 
     async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
