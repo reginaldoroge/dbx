@@ -130,6 +130,46 @@ describe("connectionStore adopting a sidebar layout written elsewhere", () => {
     vi.useRealTimers();
   });
 
+  it("serializes overlapping saves so an older snapshot cannot land last", async () => {
+    vi.useFakeTimers();
+    const store = await storeWithFlatLayout();
+    loadSidebarLayout.mockResolvedValue(ungrouped());
+    await store.syncSidebarLayoutOnce();
+
+    const deferred: Array<{ layout: SidebarLayout; resolve: () => void }> = [];
+    saveSidebarLayout.mockImplementation(
+      (layout: SidebarLayout) =>
+        new Promise<void>((resolve) => {
+          deferred.push({ layout, resolve });
+        }),
+    );
+
+    const first = store.createConnectionGroup("G1");
+    store.moveConnectionToGroup("a", first);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(deferred).toHaveLength(1);
+
+    const second = store.createConnectionGroup("G2");
+    store.moveConnectionToGroup("a", second);
+    await vi.advanceTimersByTimeAsync(300);
+    // A newer snapshot waits for the older write, so the row cannot be committed
+    // out of order and the poll cannot adopt the older layout afterwards.
+    expect(deferred).toHaveLength(1);
+
+    deferred[0].resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deferred).toHaveLength(2);
+    expect(store.groupIdForConnection("a")).toBe(second);
+
+    deferred[1].resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    loadSidebarLayout.mockResolvedValue(ungrouped());
+    await store.syncSidebarLayoutOnce();
+    expect(store.groupIdForConnection("a")).toBe(second);
+    vi.useRealTimers();
+  });
+
   it("adopts an external change once the local save has landed", async () => {
     vi.useFakeTimers();
     const store = await storeWithFlatLayout();

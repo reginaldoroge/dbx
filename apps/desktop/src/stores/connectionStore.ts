@@ -718,6 +718,8 @@ export const useConnectionStore = defineStore("connection", () => {
   let sidebarLayoutSyncTimer: ReturnType<typeof setInterval> | null = null;
   let sidebarLayoutSyncInFlight = false;
   let sidebarLayoutPersistInFlight: Promise<void> | null = null;
+  /** Tail of the save chain: writes must land in the order they were issued. */
+  let sidebarLayoutSaveChain: Promise<unknown> = Promise.resolve();
   /** JSON of the layout we know the storage holds. Anything else in memory is an
    *  unsaved local edit, and a poll that reads the old row must not revert it. */
   let sidebarLayoutPersisted: string | null = null;
@@ -10501,13 +10503,13 @@ export const useConnectionStore = defineStore("connection", () => {
       }
       if (layoutChanged) {
         layoutSaveStarted = true;
-        await api.saveSidebarLayout(nextLayout);
+        await queueSidebarLayoutSave(nextLayout);
       }
     } catch (error) {
       const rollbackErrors: unknown[] = [];
       if (layoutSaveStarted) {
         try {
-          await api.saveSidebarLayout(previousLayout);
+          await queueSidebarLayoutSave(previousLayout);
         } catch (rollbackError) {
           rollbackErrors.push(rollbackError);
         }
@@ -10593,27 +10595,39 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  function persistSidebarLayoutDebounced() {
+  /** Writes are serialized, because a save that started earlier must land before
+   *  the next one: an older snapshot committing after a newer one would leave the
+   *  row stale and the poll would then adopt it over the newer local layout. */
+  function queueSidebarLayoutSave(layout: SidebarLayout): Promise<void> {
     sidebarLayoutRevision += 1;
+    const snapshot = JSON.stringify(layout);
+    const revision = sidebarLayoutRevision;
+    const run = () => api.saveSidebarLayout(layout);
+    const save = sidebarLayoutSaveChain.then(run, run);
+    sidebarLayoutSaveChain = save.then(
+      () => undefined,
+      () => undefined,
+    );
+    const tracked = save.then(() => {
+      // Only a save that still describes the current layout counts as persisted;
+      // if the user edited meanwhile, the guard stays closed until the follow-up
+      // save lands.
+      if (revision === sidebarLayoutRevision) sidebarLayoutPersisted = snapshot;
+    });
+    sidebarLayoutPersistInFlight = tracked;
+    const settle = () => {
+      if (sidebarLayoutPersistInFlight === tracked) sidebarLayoutPersistInFlight = null;
+      sidebarLayoutRevision += 1;
+    };
+    tracked.then(settle, settle);
+    return tracked;
+  }
+
+  function persistSidebarLayoutDebounced() {
     if (layoutPersistTimer) clearTimeout(layoutPersistTimer);
     layoutPersistTimer = setTimeout(() => {
       layoutPersistTimer = null;
-      const snapshot = JSON.stringify(sidebarLayout.value);
-      const revision = sidebarLayoutRevision;
-      const pending: Promise<void> = api
-        .saveSidebarLayout(sidebarLayout.value)
-        .then(() => {
-          // Only a save that still describes the current layout counts as
-          // persisted; if the user edited meanwhile, the guard stays closed
-          // until the follow-up save lands.
-          if (revision === sidebarLayoutRevision) sidebarLayoutPersisted = snapshot;
-        })
-        .catch(() => {})
-        .finally(() => {
-          if (sidebarLayoutPersistInFlight === pending) sidebarLayoutPersistInFlight = null;
-          sidebarLayoutRevision += 1;
-        });
-      sidebarLayoutPersistInFlight = pending;
+      void queueSidebarLayoutSave(sidebarLayout.value).catch(() => {});
     }, 300);
   }
 
