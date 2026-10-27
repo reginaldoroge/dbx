@@ -228,7 +228,9 @@ fn append_to_group(entries: &mut [Value], target: &str, ids: &[String]) -> bool 
     for entry in entries {
         if entry["type"] == "group" && entry["id"].as_str() == Some(target) {
             let legacy = entry.as_object_mut().and_then(|entry| entry.remove("connectionIds"));
-            if entry.get("children").is_none() {
+            // `children: null` means "no children yet" to the desktop, so the legacy
+            // members must still be migrated and the moved ids appended.
+            if entry.get("children").map_or(true, Value::is_null) {
                 // No modern children yet: the legacy list is the only record of the members.
                 let members = dedup(
                     legacy
@@ -342,6 +344,22 @@ mod tests {
         });
         let summary = describe_layout(Some(&null_legacy)).expect("null connectionIds must be treated as absent");
         assert!(summary.groups[0].connection_ids.is_empty());
+    }
+
+    #[test]
+    fn migrates_legacy_members_when_children_are_null() {
+        let layout = json!({
+            "groups":[{"id":"g","name":"G"}],
+            "order":[{"type":"group","id":"g","children":null,"connectionIds":["a"]}]
+        });
+        let moved = move_connections_in_layout(
+            Some(&layout),
+            &SidebarGroupSpec { id: None, name: Some("G".into()) },
+            &["b".into()],
+        )
+        .expect("move into a group with null children");
+        let summary = describe_layout(Some(&moved)).expect("layout stays valid");
+        assert_eq!(summary.groups[0].connection_ids, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

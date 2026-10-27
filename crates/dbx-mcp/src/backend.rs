@@ -1737,10 +1737,15 @@ impl DbxBackend for WebBackend {
     }
 
     async fn load_sidebar_layout_raw(&self) -> Result<Option<String>, String> {
-        self.load_sidebar_layout()
+        // Take the stored text as-is: re-serializing would change whitespace and key
+        // order, so the conditional write would never match the row.
+        let body = self
+            .request(reqwest::Method::GET, "/api/layout/sidebar/raw", None)
             .await?
-            .map(|layout| serde_json::to_string(&layout).map_err(|error| error.to_string()))
-            .transpose()
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("Invalid sidebar layout response: {error}"))?;
+        Ok(body.get("raw").and_then(Value::as_str).map(str::to_string))
     }
 
     async fn replace_sidebar_layout_if_unchanged(&self, expected: Option<&str>, next: &Value) -> Result<bool, String> {

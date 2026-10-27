@@ -840,8 +840,16 @@ fn resolve_visible_group_target(
         })
         .collect::<Vec<_>>();
     if let Some(id) = request.group_id.as_deref() {
-        if !visible_groups.iter().any(|group| group.id == id) {
+        let group = visible_groups.iter().find(|group| group.id == id);
+        let Some(group) = group else {
             return Err(format!("UNKNOWN_GROUP_ID: unknown group id '{id}'"));
+        };
+        // Both selectors are accepted, but they have to agree: silently preferring
+        // the id would move into a different group than the caller named.
+        if let Some(name) = request.group.as_deref() {
+            if !group.name.trim().eq_ignore_ascii_case(name.trim()) {
+                return Err("INVALID_GROUP_REQUEST: group id and name resolve to different groups".to_string());
+            }
         }
         return Ok(SidebarGroupSpec { id: Some(id.to_string()), name: None });
     }
@@ -2994,19 +3002,6 @@ impl DbxMcpServer {
                 "This MCP session restricts connections by sidebar group, so moving them would change their permissions. Move them in the DBX window instead.",
             );
         }
-        // Resolve the target against the groups this caller can see: an id or name
-        // from a group whose members are all hidden must not come back as a result.
-        let resolved = match self.backend.load_sidebar_layout_raw().await {
-            Ok(raw) => match raw.as_deref() {
-                Some(text) => serde_json::from_str::<Value>(text).ok(),
-                None => None,
-            },
-            Err(error) => return backend_tool_error("SIDEBAR_LOAD_ERROR", error),
-        };
-        let spec = match resolve_visible_group_target(resolved.as_ref(), &connections, &request) {
-            Ok(spec) => spec,
-            Err(error) => return sidebar_error(error),
-        };
         // Read, transform and write under a compare-and-swap: two MCP calls (or an
         // MCP call and the desktop app) that move different connections must not
         // report success while one of the moves is silently overwritten.
@@ -3027,6 +3022,14 @@ impl DbxMcpServer {
                     }
                 },
                 None => None,
+            };
+            // Resolve the target against the very layout this attempt will write: a
+            // concurrent writer could otherwise hide the group (or free its name for
+            // a hidden one) between resolution and the CAS, and the stale spec would
+            // move the connection into a group this caller cannot see.
+            let spec = match resolve_visible_group_target(layout.as_ref(), &connections, &request) {
+                Ok(spec) => spec,
+                Err(error) => return sidebar_error(error),
             };
             let updated = match move_connections_in_layout(layout.as_ref(), &spec, &request.connection_ids) {
                 Ok(layout) => layout,
