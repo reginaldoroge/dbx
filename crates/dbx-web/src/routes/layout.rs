@@ -48,6 +48,25 @@ pub async fn load_sidebar_layout(State(state): State<Arc<WebState>>) -> Result<J
     Ok(Json(layout.unwrap_or(serde_json::json!(null))))
 }
 
+#[derive(serde::Serialize)]
+pub struct RawLayoutResponse {
+    pub layout: serde_json::Value,
+    /// The stored text, byte for byte. Callers that write conditionally have to
+    /// echo it back: comparing against a re-serialized copy fails on any layout
+    /// that was migrated from the legacy file with its original whitespace.
+    pub raw: Option<String>,
+}
+
+pub async fn load_sidebar_layout_raw(State(state): State<Arc<WebState>>) -> Result<Json<RawLayoutResponse>, AppError> {
+    let raw = state.app.storage.load_sidebar_layout_raw().await.map_err(AppError::from)?;
+    let layout = match raw.as_deref() {
+        Some(text) => serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|error| AppError::from(format!("Invalid sidebar layout JSON: {error}")))?,
+        None => serde_json::json!(null),
+    };
+    Ok(Json(RawLayoutResponse { layout, raw }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveTableVGroupsRequest {

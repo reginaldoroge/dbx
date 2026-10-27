@@ -801,6 +801,73 @@ impl McpScope {
     }
 }
 
+fn hidden_group_names(
+    layout: Option<&Value>,
+    connections: &[dbx_core::models::connection::ConnectionConfig],
+) -> Vec<String> {
+    let visible = connections.iter().map(|connection| connection.id.as_str()).collect::<std::collections::HashSet<_>>();
+    describe_layout(layout)
+        .map(|summary| {
+            summary
+                .groups
+                .into_iter()
+                .filter(|group| !group.connection_ids.is_empty())
+                .filter(|group| !group.connection_ids.iter().any(|id| visible.contains(id.as_str())))
+                .map(|group| group.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve a move target using only the groups this caller can see. Groups whose
+/// members are all filtered out by the MCP policy are invisible, so their id and
+/// name must not be echoed back or matched.
+fn resolve_visible_group_target(
+    layout: Option<&Value>,
+    connections: &[dbx_core::models::connection::ConnectionConfig],
+    request: &MoveConnectionsToGroupRequest,
+) -> Result<SidebarGroupSpec, String> {
+    let visible = connections.iter().map(|connection| connection.id.as_str()).collect::<std::collections::HashSet<_>>();
+    let summary = match describe_layout(layout) {
+        Ok(summary) => summary,
+        Err(error) => return Err(error),
+    };
+    let visible_groups = summary
+        .groups
+        .into_iter()
+        .filter(|group| {
+            group.connection_ids.is_empty() || group.connection_ids.iter().any(|id| visible.contains(id.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if let Some(id) = request.group_id.as_deref() {
+        if !visible_groups.iter().any(|group| group.id == id) {
+            return Err(format!("UNKNOWN_GROUP_ID: unknown group id '{id}'"));
+        }
+        return Ok(SidebarGroupSpec { id: Some(id.to_string()), name: None });
+    }
+    let Some(name) = request.group.as_deref() else {
+        return Ok(SidebarGroupSpec { id: None, name: None });
+    };
+    let matches =
+        visible_groups.iter().filter(|group| group.name.trim().eq_ignore_ascii_case(name.trim())).collect::<Vec<_>>();
+    match matches.len() {
+        0 => {
+            // A hidden group already owns that name. Creating a second one with the
+            // same name would let the next call move into the hidden group, so the
+            // request is refused without saying what the collision was.
+            let hidden_collision = hidden_group_names(layout, connections)
+                .iter()
+                .any(|hidden| hidden.trim().eq_ignore_ascii_case(name.trim()));
+            if hidden_collision {
+                return Err("INVALID_GROUP_REQUEST: that group name is not available; pass a different one".to_string());
+            }
+            Ok(SidebarGroupSpec { id: None, name: Some(name.to_string()) })
+        }
+        1 => Ok(SidebarGroupSpec { id: Some(matches[0].id.clone()), name: None }),
+        count => Err(format!("AMBIGUOUS_GROUP_NAME: group name '{name}' matches {count} groups; pass group id")),
+    }
+}
+
 impl DbxMcpServer {
     /// A desktop confirmation can lift only the high-risk SQL tier for one
     /// already-scoped operation. All other policy checks run before the prompt.
@@ -2918,7 +2985,28 @@ impl DbxMcpServer {
         if !unknown.is_empty() {
             return tool_error("UNKNOWN_CONNECTION", format!("Unknown connection IDs: {}", unknown.join(", ")));
         }
-        let spec = SidebarGroupSpec { id: request.group_id, name: request.group };
+        // Moving a connection between groups changes the group policy it inherits,
+        // so a session that scopes access by group could otherwise use this tool to
+        // shed a restriction on its own connections.
+        if dbx_core::mcp_policy::policy_uses_connection_groups(&policy) {
+            return tool_error(
+                "MCP_POLICY_MOVE_BLOCKED",
+                "This MCP session restricts connections by sidebar group, so moving them would change their permissions. Move them in the DBX window instead.",
+            );
+        }
+        // Resolve the target against the groups this caller can see: an id or name
+        // from a group whose members are all hidden must not come back as a result.
+        let resolved = match self.backend.load_sidebar_layout_raw().await {
+            Ok(raw) => match raw.as_deref() {
+                Some(text) => serde_json::from_str::<Value>(text).ok(),
+                None => None,
+            },
+            Err(error) => return backend_tool_error("SIDEBAR_LOAD_ERROR", error),
+        };
+        let spec = match resolve_visible_group_target(resolved.as_ref(), &connections, &request) {
+            Ok(spec) => spec,
+            Err(error) => return sidebar_error(error),
+        };
         // Read, transform and write under a compare-and-swap: two MCP calls (or an
         // MCP call and the desktop app) that move different connections must not
         // report success while one of the moves is silently overwritten.
@@ -7068,6 +7156,61 @@ mod tests {
         // A member the policy cannot see is not reported, not even as a bare id.
         assert!(output.contains("A (id: a, collapsed: true, 1 members): Local (c)"), "{output}");
         assert!(output.contains("Ungrouped: Root (root)"));
+    }
+
+    #[tokio::test]
+    async fn sidebar_move_is_blocked_when_the_policy_scopes_access_by_group() {
+        let mut policy = McpGlobalPolicy::default();
+        policy.group_policies.push(dbx_core::persistence::storage::McpGroupPolicy {
+            group_id: "g".into(),
+            read_only: true,
+            allow_dangerous_sql: false,
+        });
+        let backend = Arc::new(FakeBackend {
+            connections: vec![connection("a", "Alpha", "sqlite", "app")],
+            sidebar_layout: std::sync::Mutex::new(Some(json!({
+                "groups":[{"id":"g","name":"G"}],
+                "order":[{"type":"group","id":"g","children":[{"type":"connection","id":"a"}]}]
+            }))),
+            policy,
+            ..Default::default()
+        });
+        let server = DbxMcpServer::with_runtime_options(backend, McpScope::default(), false);
+        let result = server
+            .move_connections_to_group(Parameters(MoveConnectionsToGroupRequest {
+                group_id: None,
+                group: Some("Elsewhere".into()),
+                connection_ids: vec!["a".into()],
+            }))
+            .await;
+        let output = result_text(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(output.contains("MCP_POLICY_MOVE_BLOCKED"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn sidebar_move_refuses_a_group_name_owned_by_a_hidden_group() {
+        let backend = Arc::new(FakeBackend {
+            connections: vec![connection("c", "Local", "sqlite", "app")],
+            sidebar_layout: std::sync::Mutex::new(Some(json!({
+                "groups":[{"id":"secret-id","name":"Secret"}],
+                "order":[{"type":"group","id":"secret-id","children":[{"type":"connection","id":"hidden"}]},
+                    {"type":"connection","id":"c"}]
+            }))),
+            ..Default::default()
+        });
+        let server = DbxMcpServer::with_runtime_options(backend, McpScope::default(), false);
+        let result = server
+            .move_connections_to_group(Parameters(MoveConnectionsToGroupRequest {
+                group_id: None,
+                group: Some("Secret".into()),
+                connection_ids: vec!["c".into()],
+            }))
+            .await;
+        let output = result_text(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(output.contains("INVALID_GROUP_REQUEST"), "{output}");
+        assert!(!output.contains("secret-id"), "{output}");
     }
 
     #[tokio::test]

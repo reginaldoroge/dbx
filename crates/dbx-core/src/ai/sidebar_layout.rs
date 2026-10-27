@@ -84,7 +84,8 @@ fn inspect_entries(
                 let index = groups
                     .iter()
                     .position(|group| group.id == id)
-                    .ok_or_else(|| invalid(&format!("group '{id}' has no metadata")))?;
+                    // The id is not echoed: it may belong to a group the MCP policy hides.
+                    .ok_or_else(|| invalid("order entry references a group without metadata"))?;
                 if !seen.insert(id.to_string()) {
                     return Err(invalid("duplicate group order id"));
                 }
@@ -93,6 +94,7 @@ fn inspect_entries(
                 // same; keeping both in sync is what makes a later move predictable.
                 let legacy = entry
                     .get("connectionIds")
+                    .filter(|value| !value.is_null())
                     .map(|value| {
                         value
                             .as_array()
@@ -107,9 +109,11 @@ fn inspect_entries(
                     })
                     .transpose()?
                     .unwrap_or_default();
+                // `children: null` is what the desktop treats as "no children yet" (it
+                // falls back with `??`), so it must not fail validation here.
                 let members = match entry.get("children") {
-                    Some(children) => inspect_entries(children, groups, seen, false)?,
-                    None => dedup(legacy),
+                    Some(children) if !children.is_null() => inspect_entries(children, groups, seen, false)?,
+                    _ => dedup(legacy),
                 };
                 groups[index].connection_ids = members.clone();
                 if !root {
@@ -321,6 +325,23 @@ mod tests {
         assert_eq!(moved["order"][0]["children"], json!([{"type":"connection","id":"stay","custom":1}]));
         assert_eq!(moved["order"][1], layout["order"][1]);
         assert_eq!(describe_layout(Some(&moved)).unwrap().groups[1].connection_ids, ["c"]);
+    }
+
+    #[test]
+    fn treats_null_children_and_legacy_members_as_absent() {
+        let layout = json!({
+            "groups":[{"id":"g","name":"G"}],
+            "order":[{"type":"group","id":"g","children":null,"connectionIds":["a"]}]
+        });
+        let summary = describe_layout(Some(&layout)).expect("null children must fall back to connectionIds");
+        assert_eq!(summary.groups[0].connection_ids, vec!["a".to_string()]);
+
+        let null_legacy = json!({
+            "groups":[{"id":"g","name":"G"}],
+            "order":[{"type":"group","id":"g","connectionIds":null}]
+        });
+        let summary = describe_layout(Some(&null_legacy)).expect("null connectionIds must be treated as absent");
+        assert!(summary.groups[0].connection_ids.is_empty());
     }
 
     #[test]
